@@ -281,13 +281,16 @@ native interval), which can shift where ``"operation"`` control points
 land, since those are placed relative to the overall horizon -- see the
 "Operational control" section below.
 
-``interpolation="linear"`` is NOT compatible with exact mass
-conservation under this bucket convention -- it smooths values across
-bucket boundaries rather than respecting them, so summed totals will be
-close but not exact. ``"previous"`` (the default) is the only mode that
-conserves mass exactly, since it reproduces each bucket's own value
-verbatim before rescaling. Use ``"linear"`` only where a smoother-looking
-series matters more than exact volume conservation.
+``interpolation="linear"`` -- :meth:`DynamicSystemModel.load_data`'s
+default -- is NOT compatible with exact mass conservation under this
+bucket convention: it smooths values across bucket boundaries rather
+than respecting them, so summed totals will be close but not exact.
+``interpolation="previous"`` is the only mode that conserves mass
+exactly, since it reproduces each bucket's own value verbatim before
+rescaling -- pass it explicitly to ``load_data()`` whenever exact
+conservation matters more than a smoother-looking series (see
+:func:`print_mass_balance_check` for a direct way to verify which
+you're getting).
 
 Operational control (the ``"operation"`` key)
 -----------------------------------------------
@@ -363,6 +366,181 @@ JSON. The cost is a built-in one-step lag in any feedback where a
 downstream level constrains an upstream flow -- fine as long as ``dt`` is
 small relative to the system's response time.
 
+Stage-volume curves (a level's own ``"stage_volume_curve"``)
+------------------------------------------------------------------
+
+Some rate functions -- :func:`weir_francis` is the one built in here --
+need to know a level's water-surface ELEVATION (stage), not just its
+raw state (a volume). A stage-storage relationship is a property of the
+reservoir itself, not of any one outlet structure, so it's declared on
+the LEVEL, not on the flow:
+
+.. code-block:: json
+
+    {
+      "name": "reservoir",
+      "initial_state": 200.0,
+      "stage_volume_curve": {
+        "data": "./inputs/reservoir_curve.csv",
+        "fit_power": false
+      },
+      "outflows": [
+        {
+          "name": "weir_1", "type": "rate_function", "function": "weir_francis",
+          "params": {"width": 3.0, "activation_stage": 1.4}
+        },
+        {
+          "name": "weir_2", "type": "rate_function", "function": "weir_francis",
+          "params": {"width": 2.0}
+        }
+      ]
+    }
+
+Both weirs above share the exact SAME built :class:`StageVolumeCurve`
+object -- built once, in :meth:`DynamicSystemModel._build_levels` --
+rather than each holding its own copy, so there's no risk of two
+outlets on the same reservoir silently disagreeing about its shape. See
+:meth:`StageVolumeCurve.from_spec` for the full ``"data"``/
+``"column_stage"``/``"column_volume"``/``"fit_power"`` rules (a CSV
+path or an inline ``{"stage": [...], "volume": [...]}`` dict; the
+``(0, 0)`` point is always added automatically).
+
+A flow may still declare its OWN ``"stage_volume_curve"`` inside its
+``params``, overriding the level's for just that flow -- unusual
+physically (why would one outlet see a different reservoir shape than
+another?), but supported for the rare case it's actually needed. See
+:meth:`DynamicSystemModel._make_flow` for the exact resolution order:
+an explicit flow-level curve wins; otherwise the source level's own
+curve is used; if neither exists, the param is simply absent and the
+rate function raises a clear error at first use, same as any other
+missing required parameter.
+
+Whenever a level has a curve, :func:`plot_results` automatically adds a
+third subplot showing derived stage -- that level's own storage
+trajectory run back through :meth:`StageVolumeCurve.stage_from_volume`
+-- below the usual flows/level subplots. No extra call needed; a model
+with no curve anywhere still gets the original two-subplot layout.
+
+Plotting
+--------
+
+None of this is required -- with no ``"plotting"`` keys anywhere,
+:func:`plot_results` behaves exactly as if they didn't exist. Two
+independent, optional mechanisms are read from ``parameters.json``:
+
+**Per-item display**, via an optional ``"plotting"`` entry on any flow
+or level (a sibling of ``"name"``/``"type"``/etc., not nested under
+``"params"``):
+
+.. code-block:: json
+
+    {"name": "inflow", "type": "forcing",
+     "plotting": {"label": "Vazão", "color": "navy"}}
+
+``"label"`` overrides the legend text (falls back to the item's own
+``"name"`` when absent); ``"color"`` overrides the line color (any
+matplotlib color spec; falls back to matplotlib's own auto-cycling when
+absent). A level's ``"plotting"`` entry applies to BOTH its storage line
+and its derived stage line, if it has a curve -- stage always follows
+the same level's own specs and has no ``"plotting"`` entry of its own,
+since it isn't a separate item in ``parameters.json`` to begin with.
+See :attr:`Flow.label`/:attr:`Flow.color` and
+:attr:`Level.label`/:attr:`Level.color`.
+
+**Global per-subplot y-axis ranges**, via a top-level ``"plotting"`` key
+(a sibling of ``"simulation"``/``"levels"``/``"outputs"``, read only by
+:func:`plot_results` -- :class:`DynamicSystemModel` itself never looks
+at it, same as ``"outputs"``):
+
+.. code-block:: json
+
+    {
+      "plotting": {
+        "flows": {"ranges": [0, 1000]},
+        "levels": {"ranges": [0, 1000000]},
+        "stages": {"ranges": [0, 200]}
+      }
+    }
+
+Each of ``"flows"``/``"levels"``/``"stages"`` maps to that subplot's
+``[min, max]`` y-axis limits (``matplotlib.axes.Axes.set_ylim``); any
+missing key leaves that subplot on autoscale, unchanged from before.
+Fixing these ranges is what makes runs comparable at a glance -- e.g.
+re-running the same reservoir with a different forcing series or ``dt``
+and getting the SAME y-axis both times, rather than each plot silently
+rescaling to its own data.
+
+Every y-axis also uses a tighter scientific-notation threshold than
+matplotlib's default (``ScalarFormatter`` with ``set_powerlimits((-3,
+3))``, ``useMathText=True``) -- large hydrology-scale numbers (reservoir
+volumes in the hundreds of thousands, weir discharges) switch to compact
+``x10^n`` notation once they reach roughly 1000, rather than matplotlib's
+much looser default threshold (around 1e5-1e6), so they don't crowd the
+axis.
+
+Command-line interface
+--------------------------
+
+Running this file directly parses the forcing CSV and parameters JSON
+exactly like the Python API above, then plots and/or exports:
+
+.. code-block:: bash
+
+    python dynamic_systems.py inflow.csv --config parameters.json
+    python dynamic_systems.py inflow.csv -c parameters.json --save out.png
+    python dynamic_systems.py inflow.csv -c parameters.json --export run01/
+    python dynamic_systems.py --config parameters.json
+
+``--config``/``-c`` (required) points at the parameters JSON -- kept as
+a flag rather than a second positional argument, to match other
+command-line tools' conventions.
+
+The forcing CSV, by contrast, is a POSITIONAL argument and now
+OPTIONAL, following the same "CLI wins, JSON fills in" pattern as
+outputs (below):
+
+- the positional argument, when given, always wins.
+- an optional top-level ``"inputs"`` key in the parameters JSON fills in
+  when it's omitted:
+
+  .. code-block:: json
+
+      {"inputs": {"forcing": "./inflow.csv"}}
+
+The last example command above -- no positional CSV at all -- relies
+entirely on ``"inputs.forcing"``. If neither the positional argument nor
+``"inputs.forcing"`` is given, the CLI exits with a clear error rather
+than trying to run without any forcing data.
+
+Where the plot and export land can be controlled two ways, and the two
+outputs don't have to agree on which way:
+
+- ``--save PNG_PATH`` / ``--export DIR`` on the command line -- explicit,
+  and always win when given.
+- an optional top-level ``"outputs"`` key in the parameters JSON itself:
+
+  .. code-block:: json
+
+      {"outputs": {"path": "./run01"}}
+
+  ``"outputs.path"`` is a single folder (created if it doesn't already
+  exist) that, by default, both saves the plot (as ``"plot.png"``
+  inside it) AND exports the full parameters/data/results bundle into
+  it (via :meth:`DynamicSystemModel.export`) -- one place for
+  everything a run produces, with no CLI flags needed at all.
+
+The two mechanisms combine PER OUTPUT, not all-or-nothing: if
+``--save`` is given but ``--export`` isn't, the plot goes wherever
+``--save`` says while the export -- if ``"outputs.path"`` is set --
+still lands in the JSON's folder, and vice versa. If neither a flag nor
+``"outputs.path"`` resolves a given output, the original fallback
+applies: no plot path opens a window instead of saving; no export
+directory skips exporting. Both ``"inputs"`` and ``"outputs"`` are read
+ONLY by the CLI block at the bottom of this file -- :class:`DynamicSystemModel`
+itself never looks at either of them (``load_parameters()``/
+``setup_model()`` don't care about any key beyond
+``"simulation"``/``"levels"``).
+
 Full worked example
 --------------------
 
@@ -418,10 +596,11 @@ and a ramped-up irrigation inflow, to exercise ``"operation"`` as well):
             }
           ]
         }
-      ]
+      ],
+      "outputs": {"path": "./run01"}
     }
 
-Running it:
+Running it from Python:
 
 .. code-block:: python
 
@@ -436,11 +615,20 @@ Running it:
     fig, _ = plot_results(model)
     fig.savefig("storage.png")
 
-Or from the command line:
+Or from the command line -- the ``"outputs"`` key above means a bare
+invocation already creates ``./run01/`` and puts both the plot and the
+full export bundle in it, with no ``--save``/``--export`` needed:
 
 .. code-block:: bash
 
-    python dynamic_systems.py inflow.csv --config parameters.json --save storage.png
+    python dynamic_systems.py inflow.csv --config parameters.json
+
+Explicit flags still override that per-output when given, e.g. to save
+the plot somewhere else while still exporting into ``./run01/``:
+
+.. code-block:: bash
+
+    python dynamic_systems.py inflow.csv -c parameters.json --save storage.png
 """
 
 import json
@@ -789,6 +977,24 @@ class StageVolumeCurve:
             return 0.0 if volume <= 0 else float(volume) ** self._exponent
         return float(np.interp(volume, self.volume, self.stage))
 
+    def stage_from_volume_array(self, volumes):
+        """Vectorized sibling of :meth:`stage_from_volume`, for
+        converting a whole array/Series of volumes at once (e.g. an
+        entire results column) without one Python-level call per row.
+        Same rules and same flat-extrapolation caveat apply -- see that
+        method's docstring.
+
+        :param volumes: Volumes to convert.
+        :type volumes: array-like
+        :returns: Corresponding stages, same shape as ``volumes``.
+        :rtype: numpy.ndarray
+        """
+        volumes = np.asarray(volumes, dtype=float)
+        if self.fit_power:
+            positive = np.clip(volumes, 0.0, None)
+            return np.where(volumes > 0, positive ** self._exponent, 0.0)
+        return np.interp(volumes, self.volume, self.stage)
+
     @classmethod
     def from_spec(cls, spec):
         """Build a :class:`StageVolumeCurve` from a flow's
@@ -886,20 +1092,30 @@ def weir_francis(state, t, params):
     (``"width"``, meters), and :math:`H` is the head above the crest.
 
     The level's own state is a VOLUME, not an elevation, so head is
-    derived via the flow's ``"stage_volume_curve"``
-    (:class:`StageVolumeCurve`):
+    derived via a stage-volume relationship
+    (:class:`StageVolumeCurve`) -- normally the ``"stage_volume_curve"``
+    on the flow's own SOURCE level (a stage-storage curve is a property
+    of the reservoir itself, so any number of weirs draining the same
+    level share this one curve automatically -- see
+    :attr:`Level.stage_volume_curve`); a flow may instead declare its
+    own ``"stage_volume_curve"`` in its ``params`` to override this for
+    just that flow. Either way, by the time this function runs the curve
+    has already been resolved into an object -- see
+    :meth:`DynamicSystemModel._make_flow`:
 
     .. math::
 
         H = \max(h(S_{source}) - h_{activation},\ 0)
 
     where :math:`h(\cdot)` is :meth:`StageVolumeCurve.stage_from_volume`
-    and :math:`h_{activation}` (``"activation_level"``, meters, default
+    and :math:`h_{activation}` (``"activation_stage"``, meters, default
     0.0) is the crest's own elevation above the curve's zero point --
-    i.e. how high the crest sits above the reservoir bottom. Note this
-    is a STAGE-domain threshold (meters), unlike :func:`linear_decay`'s
-    ``"activation_level"``, which is in the level's own state units
-    directly (there is no stage-volume curve involved in that formula).
+    i.e. how high the crest sits above the reservoir bottom. Named
+    ``"activation_stage"`` rather than ``"activation_level"`` precisely
+    to avoid this exact ambiguity: it's a STAGE-domain threshold
+    (meters), not a value in this level's own state units, unlike
+    :func:`linear_decay`'s ``"activation_level"`` (no stage-volume curve
+    is involved in that formula at all).
 
     The Francis formula is dimensionally fixed to SI seconds (:math:`Q`
     comes out in :math:`m^3/s`), but every flow value in this module
@@ -916,17 +1132,18 @@ def weir_francis(state, t, params):
     :param params: Must include ``"width"`` (:math:`L`, meters --
         MANDATORY, no default) and ``"stage_volume_curve"`` (already
         resolved into a :class:`StageVolumeCurve` object by
-        :meth:`DynamicSystemModel._build_flows` -- see
-        :data:`CURVE_PARAMS` -- this function never sees the raw JSON
-        spec). May include ``"activation_level"`` (:math:`h_{activation}`,
-        meters; default 0.0). Also carries ``"source"``, ``"target"``,
-        and ``"_seconds_per_dt_unit"``, all injected automatically.
+        :meth:`DynamicSystemModel._make_flow` -- typically from the
+        flow's source level, see above -- this function never sees a
+        raw JSON spec). May include ``"activation_stage"``
+        (:math:`h_{activation}`, meters; default 0.0). Also carries
+        ``"source"``, ``"target"``, and ``"_seconds_per_dt_unit"``, all
+        injected automatically.
     :type params: dict
     :returns: The outflow rate :math:`Q`, in cubic meters per ``dt_unit``.
     :rtype: float
     """
     width = params["width"]
-    activation = params.get("activation_level", 0.0)
+    activation = params.get("activation_stage", 0.0)
     curve = params["stage_volume_curve"]
     seconds_per_dt_unit = params["_seconds_per_dt_unit"]
 
@@ -1317,13 +1534,40 @@ class Level:
     :type min_state: float or None
     :param max_state: Optional upper bound enforced by :meth:`clip`.
     :type max_state: float or None
+    :param stage_volume_curve: Optional stage-storage relationship for
+        this level, built once from its own ``"stage_volume_curve"``
+        JSON entry (see :meth:`StageVolumeCurve.from_spec`). A
+        stage-storage curve is a property of the reservoir itself, NOT
+        of any one outlet structure -- any number of weirs (or other
+        stage-dependent rate functions) attached to this level share
+        this SAME curve object rather than each building/holding their
+        own. See :meth:`DynamicSystemModel._make_flow` for how a
+        :func:`weir_francis`-style flow resolves its own curve from
+        here by default.
+    :type stage_volume_curve: StageVolumeCurve or None
+    :param label: Optional display label for :func:`plot_results`,
+        from this level's own ``"plotting"`` JSON entry (see the module
+        docstring's "Plotting" section). Falls back to ``name`` when
+        ``None``. Applies to BOTH this level's storage line and its
+        derived stage line, if any -- stage always follows the same
+        level's own plotting specs, it has no ``"plotting"`` entry of
+        its own.
+    :type label: str or None
+    :param color: Optional line color for :func:`plot_results`, same
+        source and same storage/stage sharing as ``label``. ``None``
+        lets matplotlib auto-cycle colors as before.
+    :type color: str or None
     """
 
-    def __init__(self, name, initial_state, min_state=None, max_state=None):
+    def __init__(self, name, initial_state, min_state=None, max_state=None,
+                 stage_volume_curve=None, label=None, color=None):
         self.name = name
         self.initial_state = float(initial_state)
         self.min_state = min_state
         self.max_state = max_state
+        self.stage_volume_curve = stage_volume_curve
+        self.label = label
+        self.color = color
 
     def clip(self, value):
         """Clamp ``value`` to ``[min_state, max_state]``.
@@ -1372,10 +1616,20 @@ class Flow:
         everywhere), which is the default. See the module docstring's
         "Operational control" section.
     :type operation: pandas.Series or None
+    :param label: Optional display label for :func:`plot_results`, from
+        this flow's own ``"plotting"`` JSON entry (see the module
+        docstring's "Plotting" section). Falls back to ``name`` when
+        ``None``.
+    :type label: str or None
+    :param color: Optional line color for :func:`plot_results`, same
+        source as ``label``. ``None`` lets matplotlib auto-cycle colors
+        as before.
+    :type color: str or None
     """
 
     def __init__(self, name, kind, source=None, target=None,
-                 forcing=None, function=None, params=None, operation=None):
+                 forcing=None, function=None, params=None, operation=None,
+                 label=None, color=None):
         self.name = name
         self.kind = kind
         self.source = source
@@ -1384,6 +1638,8 @@ class Flow:
         self.function = function
         self.params = params or {}
         self.operation = operation
+        self.label = label
+        self.color = color
 
     def value(self, state, t, forcing_row):
         """Evaluate this flow's value at time ``t``.
@@ -1507,7 +1763,16 @@ class DynamicSystemModel:
         :param time_col: Name of the timestamp column.
         :type time_col: str
         :param interpolation: Gap-fill mode passed through to every
-            :class:`Forcing` built from this table.
+            :class:`Forcing` built from this table. Defaults to
+            ``"linear"`` for smoother-looking series when downscaling.
+            Pass ``"previous"`` explicitly for EXACT mass conservation
+            instead -- see the module docstring's "Forcing values and
+            mass conservation across dt" section for why the two modes
+            differ there (``"linear"`` smooths across bucket boundaries
+            rather than respecting them, so summed totals will be close
+            but not exact; ``"previous"`` reproduces every bucket's own
+            value verbatim before rescaling, and is the only mode that's
+            exact).
         :type interpolation: str
         :returns: ``self``, for chaining.
         :rtype: DynamicSystemModel
@@ -1629,15 +1894,35 @@ class DynamicSystemModel:
 
     def _build_levels(self):
         """Build :class:`Level` objects from
-        ``self.parameters["levels"]``.
+        ``self.parameters["levels"]``, including each level's own
+        ``"stage_volume_curve"`` if given (see :meth:`StageVolumeCurve.
+        from_spec`) -- built once here, shared by any number of flows
+        attached to this level rather than rebuilt per flow -- and its
+        own ``"plotting"`` entry, if given (see the module docstring's
+        "Plotting" section).
 
         :returns: None
+        :raises ValueError: If a level's ``"stage_volume_curve"`` is
+            invalid; see :meth:`StageVolumeCurve.from_spec`.
         """
-        self.levels = {
-            lv["name"]: Level(lv["name"], lv["initial_state"],
-                               lv.get("min"), lv.get("max"))
-            for lv in self.parameters["levels"]
-        }
+        self.levels = {}
+        for lv in self.parameters["levels"]:
+            curve_spec = lv.get("stage_volume_curve")
+            if curve_spec is not None:
+                try:
+                    curve = StageVolumeCurve.from_spec(curve_spec)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Level {lv['name']!r}, param 'stage_volume_curve': {exc}"
+                    ) from exc
+            else:
+                curve = None
+            plotting = lv.get("plotting") or {}
+            self.levels[lv["name"]] = Level(
+                lv["name"], lv["initial_state"], lv.get("min"), lv.get("max"),
+                stage_volume_curve=curve,
+                label=plotting.get("label"), color=plotting.get("color"),
+            )
 
     def _build_flows(self):
         """Build :class:`Flow` objects from each level's own nested
@@ -1713,10 +1998,27 @@ class DynamicSystemModel:
 
         for key in CURVE_PARAMS.get(function_name, ()):
             if key in params:
+                # explicit flow-level override -- build a curve just for
+                # this flow, taking precedence over its source level's own
                 try:
                     params[key] = StageVolumeCurve.from_spec(params[key])
                 except ValueError as exc:
                     raise ValueError(f"Flow {fl.get('name')!r}, param {key!r}: {exc}") from exc
+            elif key == "stage_volume_curve" and source is not None:
+                # no flow-level override -- fall back to the curve already
+                # built on this flow's own SOURCE level (see
+                # Level.stage_volume_curve / _build_levels()): a
+                # stage-storage relationship is a property of the
+                # reservoir itself, not of any one outlet structure, so
+                # any number of weirs draining the same level share this
+                # SAME curve object rather than each needing their own.
+                level = self.levels.get(source)
+                if level is not None and level.stage_volume_curve is not None:
+                    params[key] = level.stage_volume_curve
+                # else: leave 'stage_volume_curve' absent -- the rate
+                # function (e.g. weir_francis) raises a clear KeyError at
+                # first evaluation, same as any other missing required
+                # param (e.g. "width").
 
         if function_name in RATE_IN_SECONDS_FUNCTIONS:
             params["_seconds_per_dt_unit"] = _SECONDS_PER_DT_UNIT[self.dt_units]
@@ -1725,6 +2027,7 @@ class DynamicSystemModel:
             operation = build_operation_factor(fl.get("operation"), self.time_index)
         except ValueError as exc:
             raise ValueError(f"Flow {fl.get('name')!r}: {exc}") from exc
+        plotting = fl.get("plotting") or {}
         return Flow(
             name=fl["name"],
             kind=fl["type"],
@@ -1734,6 +2037,8 @@ class DynamicSystemModel:
             function=function_name,
             params=params,
             operation=operation,
+            label=plotting.get("label"),
+            color=plotting.get("color"),
         )
 
     #: maps a human-friendly dt_units value to the unit code pandas.Timedelta expects
@@ -1946,7 +2251,18 @@ class DynamicSystemModel:
         purely for reporting -- nothing upstream of this method ever
         sees or uses the delivered-amount form.
 
-        :returns: The combined levels + flows DataFrame.
+        For any level with a ``stage_volume_curve`` (see
+        :attr:`Level.stage_volume_curve`), an additional
+        ``"<level_name>_stage"`` column is also added -- that level's
+        own storage column run through
+        :meth:`StageVolumeCurve.stage_from_volume_array`. This ships
+        derived stage directly in ``self.results`` (and therefore in
+        anything built from it, e.g. :meth:`export`'s ``results.csv``)
+        rather than leaving it something only :func:`plot_results` can
+        see -- computed once here, not recomputed per consumer.
+
+        :returns: The combined levels + flows (+ any derived stage)
+            DataFrame.
         :rtype: pandas.DataFrame
         :raises RuntimeError: If called before :meth:`setup_model`.
         """
@@ -1962,6 +2278,13 @@ class DynamicSystemModel:
         records.append(dict(t=self.time_index[-1], **state))
 
         self.results = pd.DataFrame.from_records(records).set_index("t")
+
+        for name, level in self.levels.items():
+            if level.stage_volume_curve is not None:
+                self.results[f"{name}_stage"] = level.stage_volume_curve.stage_from_volume_array(
+                    self.results[name]
+                )
+
         return self.results
 
     def evaluate(self):
@@ -2032,15 +2355,34 @@ class DynamicSystemModel:
 
 def plot_results(model, results=None, flows_to_plot=None,
                   levels_to_plot=None, figsize=(9, 6), title=None):
-    """Plot a model's results as two stacked subplots sharing the time
-    axis: flows on top, level state trajectories on the bottom.
+    """Plot a model's results as stacked subplots sharing the time axis:
+    flows on top, level state (storage) trajectories in the middle, and
+    -- ONLY for levels that have a ``"stage_volume_curve"`` (see
+    :attr:`Level.stage_volume_curve`) -- derived stage trajectories on
+    the bottom.
 
     Defaults to ``model.results`` (the one combined DataFrame populated
     by :meth:`DynamicSystemModel.solve`) -- which columns go in which
     subplot is worked out from ``model.levels`` / ``model.flows``, not
-    from separate DataFrames. Kept as a plain function, not a model
-    method -- visualization is meant to move out of this file once it
-    grows, same reasoning as the rate-function registry.
+    from separate DataFrames. ``model.results`` already ships a
+    ``"<level_name>_stage"`` column for any level with a curve (see
+    :meth:`DynamicSystemModel.solve`); this function reads that column
+    directly when present, and only falls back to computing stage
+    on the fly (via :meth:`StageVolumeCurve.stage_from_volume_array`)
+    when a custom ``results=`` DataFrame is passed without it. If no
+    plotted level has a curve, the stage subplot is omitted and the
+    figure looks exactly as it did before this existed.
+
+    Per-item and global display options both come from
+    ``model.parameters`` -- see the module docstring's "Plotting"
+    section for the full ``"plotting"`` JSON schema (per-flow/per-level
+    ``"label"``/``"color"``, and global per-subplot ``"ranges"``). None
+    of it is required: with no ``"plotting"`` keys anywhere, this
+    function behaves exactly as it did before they existed.
+
+    Kept as a plain function, not a model method -- visualization is
+    meant to move out of this file once it grows, same reasoning as the
+    rate-function registry.
 
     :param model: The model to plot.
     :type model: DynamicSystemModel
@@ -2054,42 +2396,109 @@ def plot_results(model, results=None, flows_to_plot=None,
         all of ``model.levels``.
     :type levels_to_plot: list[str] or None
     :param figsize: Matplotlib figure size, ``(width, height)`` in
-        inches.
+        inches, for the default 2-subplot case -- scaled up
+        proportionally when a third (stage) subplot is added.
     :type figsize: tuple[float, float]
     :param title: Optional figure suptitle.
     :type title: str or None
-    :returns: ``(fig, (ax_flows, ax_levels))``.
+    :returns: ``(fig, (ax_flows, ax_levels))`` normally, or
+        ``(fig, (ax_flows, ax_levels, ax_stage))`` if at least one
+        plotted level has a stage-volume curve.
     :rtype: tuple[matplotlib.figure.Figure, tuple]
     """
     import matplotlib.pyplot as plt
+    from matplotlib.ticker import ScalarFormatter
 
     if results is None:
         results = model.results
 
     level_cols = levels_to_plot or list(model.levels.keys())
     flow_cols = flows_to_plot or [flow.name for flow in model.flows]
+    stage_levels = [
+        name for name in level_cols
+        if model.levels[name].stage_volume_curve is not None
+    ]
+    flows_by_name = {flow.name: flow for flow in model.flows}
+    plotting_global = (model.parameters or {}).get("plotting") or {}
 
-    fig, (ax_flows, ax_levels) = plt.subplots(2, 1, figsize=figsize, sharex=True)
+    def _compact_formatter():
+        """A tick formatter that switches to scientific notation ('x10^3'
+        style, via useMathText) once values reach roughly +/-1000 or
+        fall below +/-0.001, instead of matplotlib's much looser default
+        -- keeps large hydrology-scale numbers (reservoir volumes,
+        weir discharges) from crowding the axis.
+        """
+        fmt = ScalarFormatter(useMathText=True)
+        fmt.set_powerlimits((-3, 3))
+        return fmt
+
+    def _apply_range(ax, subplot_key):
+        """Apply this subplot's global y-axis range, if
+        ``plotting.<subplot_key>.ranges`` is set in parameters.json --
+        e.g. ``{"plotting": {"levels": {"ranges": [0, 1000000]}}}``.
+        Left on autoscale (unchanged) if absent.
+        """
+        ranges = (plotting_global.get(subplot_key) or {}).get("ranges")
+        if ranges is not None:
+            ax.set_ylim(ranges[0], ranges[1])
+
+    n_rows = 3 if stage_levels else 2
+    fig, axes = plt.subplots(
+        n_rows, 1, figsize=(figsize[0], figsize[1] * n_rows / 2), sharex=True
+    )
+    ax_flows, ax_levels = axes[0], axes[1]
+    ax_stage = axes[2] if stage_levels else None
 
     if flow_cols:
         for col in flow_cols:
-            ax_flows.plot(results.index, results[col], label=col)
+            flow = flows_by_name.get(col)
+            label = flow.label if flow and flow.label else col
+            color = flow.color if flow else None
+            ax_flows.plot(results.index, results[col], label=label, color=color)
         ax_flows.set_ylabel("flow")
         ax_flows.set_title("Input / output flows")
         ax_flows.legend(loc="best")
+        ax_flows.yaxis.set_major_formatter(_compact_formatter())
+        _apply_range(ax_flows, "flows")
     else:
         ax_flows.set_visible(False)
 
     for col in level_cols:
-        ax_levels.plot(results.index, results[col], label=col, color="tab:blue")
+        level = model.levels[col]
+        label = level.label or col
+        ax_levels.plot(results.index, results[col], label=label, color=level.color)
     ax_levels.set_ylabel("level (storage)")
-    ax_levels.set_xlabel("time")
-    ax_levels.set_title("Level")
+    ax_levels.set_title("Level (storage)" if stage_levels else "Level")
     ax_levels.legend(loc="best")
+    ax_levels.yaxis.set_major_formatter(_compact_formatter())
+    _apply_range(ax_levels, "levels")
+    if ax_stage is None:
+        ax_levels.set_xlabel("time")
+
+    if ax_stage is not None:
+        for name in stage_levels:
+            level = model.levels[name]
+            stage_col = f"{name}_stage"
+            if stage_col in results.columns:
+                stage_series = results[stage_col]
+            else:
+                stage_series = level.stage_volume_curve.stage_from_volume_array(results[name])
+            # stage always follows the same level's own plotting specs --
+            # it has no "plotting" entry of its own (see module docstring)
+            label = level.label or name
+            ax_stage.plot(results.index, stage_series, label=label, color=level.color)
+        ax_stage.set_ylabel("stage (m)")
+        ax_stage.set_xlabel("time")
+        ax_stage.set_title("Stage (derived from stage-volume curve)")
+        ax_stage.legend(loc="best")
+        ax_stage.yaxis.set_major_formatter(_compact_formatter())
+        _apply_range(ax_stage, "stages")
 
     if title:
         fig.suptitle(title)
     fig.tight_layout()
+    if ax_stage is not None:
+        return fig, (ax_flows, ax_levels, ax_stage)
     return fig, (ax_flows, ax_levels)
 
 
@@ -2116,9 +2525,21 @@ def print_mass_balance_check(model):
       rate -- see that method's docstring), summing the column directly
       gives the true total, with no further scaling needed here.
 
-    Under ``interpolation="previous"`` (the default) these two totals
-    match exactly. Under ``"linear"`` they will be close but not exact
-    -- see the module docstring for why.
+    Under ``interpolation="previous"`` these two totals match exactly.
+    Under ``"linear"`` (:meth:`DynamicSystemModel.load_data`'s default)
+    they will be close but not exact -- see the module docstring for
+    why.
+
+    **Caveat:** this check is entirely about resampling/rescaling
+    fidelity -- it does NOT account for ``"operation"`` gating. If any
+    flow reading a given forcing key has an ``"operation"`` entry (see
+    the module docstring's "Operational control" section), that flow's
+    delivered total will legitimately be LESS than the raw forcing
+    total by design (an irrigation schedule that's mostly closed is
+    *supposed* to deliver less than the raw supply would allow) -- a
+    large diff there reflects intentional throttling, not a resampling
+    bug. This function flags that explicitly per forcing key below
+    rather than leaving it to look like an unexplained discrepancy.
 
     :param model: A model that has already been run (``model.results``
         and ``model.data`` populated -- i.e. after
@@ -2136,10 +2557,19 @@ def print_mass_balance_check(model):
             delivered_total = float("nan")
         diff = delivered_total - raw_total
         pct = (diff / raw_total * 100.0) if raw_total else float("nan")
+        gated_by = [
+            flow.name for flow in model.flows
+            if flow.forcing == name and flow.operation is not None
+        ]
+        note = (
+            f"   (gated by 'operation' on {gated_by} -- diff reflects "
+            f"intentional throttling, not a resampling issue)"
+            if gated_by else ""
+        )
         print(
             f"  {name!r}: raw total = {raw_total:,.4f}   "
             f"delivered total = {delivered_total:,.4f}   "
-            f"diff = {diff:,.6f} ({pct:+.4f}%)"
+            f"diff = {diff:,.6f} ({pct:+.4f}%){note}"
         )
 
 
@@ -2149,10 +2579,27 @@ def print_mass_balance_check(model):
 # python dynamic_systems.py example_inflow.csv --config example_parameters.json
 # python dynamic_systems.py example_inflow.csv -c example_parameters.json --save out.png
 # python dynamic_systems.py example_inflow.csv -c example_parameters.json --export run01/
+# python dynamic_systems.py --config example_parameters.json   # inputs.forcing in the JSON
 #
 # DynamicSystemModel is usable directly -- subclass it only for a data
 # shape the generic load_data()/_resolve_data_from_flows() pattern can't
 # express (see the module docstring's "Forcing data" section).
+#
+# Inputs -- the positional CSV argument vs. the parameters file's own
+# "inputs" section
+# ----------------------------------------------------------------------
+# The forcing CSV positional argument is now optional. If given, it
+# always wins. If omitted, an optional top-level "inputs" key in the
+# parameters JSON fills in instead:
+#
+#     {"inputs": {"forcing": "/path/to/inflow.csv"}}
+#
+# Same priority rule as "outputs" below: the CLI argument, when given,
+# always takes precedence over "inputs.forcing" -- it is NOT merged or
+# combined, just a fallback for whichever one is missing. If neither is
+# given, the CLI exits with a clear error rather than trying to run
+# without any forcing data. This key is read ONLY here, by the CLI --
+# DynamicSystemModel itself never looks at "inputs".
 #
 # Outputs -- CLI flags vs. the parameters file's own "outputs" section
 # ----------------------------------------------------------------------
@@ -2182,10 +2629,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Run a DynamicSystemModel and plot the result."
     )
-    parser.add_argument("data", help="Path to the forcing CSV")
+    parser.add_argument("data", nargs="?", default=None,
+                         help="Path to the forcing CSV. Optional if 'inputs.forcing' is "
+                              "set in --config -- see above; if both are given, this wins.")
     parser.add_argument("--config", "-c", required=True,
                          help="Path to the parameters JSON (levels/flows/simulation, "
-                              "optionally an 'outputs' section -- see above)")
+                              "optionally 'inputs'/'outputs' sections -- see above)")
     parser.add_argument("--save", metavar="PNG_PATH", default=None,
                          help="Save the plot to this path instead of opening a window. "
                               "Takes priority over the parameters file's 'outputs.path'.")
@@ -2195,8 +2644,17 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     model = DynamicSystemModel()
-    model.load_data(args.data)
     model.load_parameters(args.config)
+
+    inputs = model.parameters.get("inputs") or {}
+    data_path = args.data or inputs.get("forcing")
+    if not data_path:
+        parser.error(
+            "No forcing CSV given -- pass it positionally, or set "
+            "'inputs.forcing' in --config."
+        )
+
+    model.load_data(data_path)
     model.run()
 
     print()
