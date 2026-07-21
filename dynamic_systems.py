@@ -440,7 +440,7 @@ Or from the command line:
 
 .. code-block:: bash
 
-    python dynamic_systems.py inflow.csv parameters.json --save storage.png
+    python dynamic_systems.py inflow.csv --config parameters.json --save storage.png
 """
 
 import json
@@ -2146,13 +2146,35 @@ def print_mass_balance_check(model):
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
-# python dynamic_systems.py example_inflow.csv example_parameters.json
-# python dynamic_systems.py example_inflow.csv example_parameters.json --save out.png
-# python dynamic_systems.py example_inflow.csv example_parameters.json --export run01/
+# python dynamic_systems.py example_inflow.csv --config example_parameters.json
+# python dynamic_systems.py example_inflow.csv -c example_parameters.json --save out.png
+# python dynamic_systems.py example_inflow.csv -c example_parameters.json --export run01/
 #
 # DynamicSystemModel is usable directly -- subclass it only for a data
 # shape the generic load_data()/_resolve_data_from_flows() pattern can't
 # express (see the module docstring's "Forcing data" section).
+#
+# Outputs -- CLI flags vs. the parameters file's own "outputs" section
+# ----------------------------------------------------------------------
+# --save/--export are optional and, if given, always win. If either is
+# omitted, an optional top-level "outputs" key in the parameters JSON
+# fills in for that one specifically -- independently, not all-or-nothing:
+#
+#     {"outputs": {"path": "/path/to/run01"}}
+#
+# "outputs.path" is a single folder (created if missing) that, by
+# default (i.e. whenever the corresponding CLI flag is absent), both
+# saves the plot (as "plot.png" inside it) AND exports parameters/data/
+# results into it (via DynamicSystemModel.export) -- the same "created
+# if not existing, saves the visual and exports the data" behavior
+# either way it's reached. This key is read ONLY here, by the CLI --
+# DynamicSystemModel itself never looks at "outputs" (load_parameters()/
+# setup_model() ignore any keys beyond "simulation"/"levels").
+#
+# If neither a CLI flag nor "outputs.path" resolves a given output, the
+# original fallback behavior applies: no --save and no "outputs.path"
+# opens a plot window instead of saving; no --export and no
+# "outputs.path" skips exporting.
 
 if __name__ == "__main__":
     import argparse
@@ -2161,30 +2183,41 @@ if __name__ == "__main__":
         description="Run a DynamicSystemModel and plot the result."
     )
     parser.add_argument("data", help="Path to the forcing CSV")
-    parser.add_argument("parameters", help="Path to the parameters JSON (levels/flows/simulation)")
+    parser.add_argument("--config", "-c", required=True,
+                         help="Path to the parameters JSON (levels/flows/simulation, "
+                              "optionally an 'outputs' section -- see above)")
     parser.add_argument("--save", metavar="PNG_PATH", default=None,
-                         help="Save the plot to this path instead of opening a window")
+                         help="Save the plot to this path instead of opening a window. "
+                              "Takes priority over the parameters file's 'outputs.path'.")
     parser.add_argument("--export", metavar="DIR", default=None,
-                         help="Also export parameters/data/results to this directory")
+                         help="Also export parameters/data/results to this directory. "
+                              "Takes priority over the parameters file's 'outputs.path'.")
     args = parser.parse_args()
 
     model = DynamicSystemModel()
     model.load_data(args.data)
-    model.load_parameters(args.parameters)
+    model.load_parameters(args.config)
     model.run()
 
     print()
     print_mass_balance_check(model)
 
-    if args.export:
-        model.export(path=args.export)
-        print(f"Exported to {args.export}")
+    outputs = model.parameters.get("outputs") or {}
+    outputs_path = outputs.get("path")
+
+    save_path = args.save or (str(Path(outputs_path) / "plot.png") if outputs_path else None)
+    export_dir = args.export or outputs_path
+
+    if export_dir:
+        model.export(path=export_dir)
+        print(f"Exported to {export_dir}")
 
     fig, _ = plot_results(model)
 
-    if args.save:
-        fig.savefig(args.save, dpi=150)
-        print(f"Saved plot to {args.save}")
+    if save_path:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=150)
+        print(f"Saved plot to {save_path}")
     else:
         import matplotlib.pyplot as plt
         plt.show()
