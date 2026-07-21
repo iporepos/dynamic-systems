@@ -1,6 +1,7 @@
 outputs/
 inputs/
 .idea
+bench*.py
 
 *.local*
 
