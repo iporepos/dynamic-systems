@@ -292,6 +292,42 @@ conservation matters more than a smoother-looking series (see
 :func:`print_mass_balance_check` for a direct way to verify which
 you're getting).
 
+Upscaled results
+------------------
+
+:meth:`DynamicSystemModel.solve` runs at the simulation's own ``dt``,
+often much finer than the forcing data's own native cadence (that's the
+whole point of "Forcing values and mass conservation across dt" above).
+``self.results_upscaled`` is ``self.results`` resampled back onto that
+NATIVE cadence -- so it can be merged directly against the original
+forcing table, or just compared at a glance without thousands of fine
+rows -- built automatically at the end of every :meth:`~DynamicSystemModel.solve`
+call, and written alongside ``results.csv`` as ``results_upscaled.csv``
+whenever :meth:`~DynamicSystemModel.export` is given a path.
+
+Which aggregation applies is worked out per column, from what each one
+physically represents -- not one blanket rule:
+
+- **flow columns** are SUMMED. ``self.results`` already stores each
+  flow's DELIVERED AMOUNT per fine step (see
+  :meth:`~DynamicSystemModel.solve`), so summing consecutive fine
+  steps' amounts gives the correct coarser-bucket total -- the same
+  principle as ``"aggregation": "sum"`` on a forcing column.
+- **level and derived ``"<level>_stage"`` columns** are AVERAGED. Both
+  are point-in-time STATE snapshots (a storage or a derived elevation),
+  not deliverable totals, so a coarser bucket's representative value is
+  a mean over the fine steps within it.
+
+The target cadence itself comes from the forcing data's own raw
+timestamps (via the same "native interval" concept as the mass
+conservation section above), so this only works when a raw table was
+actually loaded the generic way -- ``self.results_upscaled`` is ``None``
+(and no ``results_upscaled.csv`` is written) if a subclass overrode
+:meth:`~DynamicSystemModel.load_data` to populate ``self.data`` some
+other way, with no single native cadence to resample onto. See
+:meth:`DynamicSystemModel._build_results_upscaled` for the exact
+mechanics.
+
 Operational control (the ``"operation"`` key)
 -----------------------------------------------
 
@@ -1722,6 +1758,12 @@ class DynamicSystemModel:
     :vartype forcing_on_grid: pandas.DataFrame or None
     :ivar results: Combined levels + flows output of :meth:`solve`.
     :vartype results: pandas.DataFrame or None
+    :ivar results_upscaled: ``results`` resampled back onto the forcing
+        data's own native cadence -- see :meth:`solve` and the module
+        docstring's "Upscaled results" section. ``None`` if it couldn't
+        be built (no raw forcing table available, e.g. a subclass
+        overrode :meth:`load_data`).
+    :vartype results_upscaled: pandas.DataFrame or None
     """
 
     def __init__(self):
@@ -1735,6 +1777,7 @@ class DynamicSystemModel:
         self.time_index = None
         self.forcing_on_grid = None
         self.results = None
+        self.results_upscaled = None
         self._forcing_table = None
         self._forcing_time_col = None
         self._forcing_interpolation = None
@@ -2261,8 +2304,14 @@ class DynamicSystemModel:
         rather than leaving it something only :func:`plot_results` can
         see -- computed once here, not recomputed per consumer.
 
+        ``self.results_upscaled`` is also built here -- ``self.results``
+        resampled back onto the forcing data's own (coarser) native
+        cadence, flows summed and levels/stage columns averaged. See
+        :meth:`_build_results_upscaled` and the module docstring's
+        "Upscaled results" section.
+
         :returns: The combined levels + flows (+ any derived stage)
-            DataFrame.
+            DataFrame, at the simulation's own fine ``dt``.
         :rtype: pandas.DataFrame
         :raises RuntimeError: If called before :meth:`setup_model`.
         """
@@ -2285,7 +2334,78 @@ class DynamicSystemModel:
                     self.results[name]
                 )
 
+        self.results_upscaled = self._build_results_upscaled()
+
         return self.results
+
+    def _build_results_upscaled(self):
+        """Resample ``self.results`` (at the simulation's own, typically
+        finer, ``dt``) back onto the forcing data's own native cadence
+        -- "the sourced time step" -- producing a coarser companion
+        table meant for comparing against or merging with the original
+        forcing data directly. See the module docstring's "Upscaled
+        results" section for the motivation and the exact rules.
+
+        Column-by-column aggregation follows what each column
+        physically represents, not a single blanket rule:
+
+        - **flow columns** (matching a name in ``self.flows``) are
+          SUMMED -- ``self.results`` already stores each flow's
+          DELIVERED AMOUNT per fine step (see :meth:`solve`), so summing
+          several consecutive fine steps' amounts gives the correct
+          coarser-bucket total, exactly the way :func:`align_series_to_grid`
+          already sums native forcing buckets for an
+          ``"aggregation": "sum"`` column.
+        - **level and derived stage columns** (matching a name in
+          ``self.levels`` or a ``"<level>_stage"`` column) are AVERAGED
+          -- both are point-in-time STATE snapshots, not deliverable
+          totals, so a coarser bucket's representative value is a mean
+          over the fine steps that fall within it, not a sum.
+
+        The target grid is derived from the raw forcing table's own
+        timestamps (``self._forcing_table``/``self._forcing_time_col``)
+        via :func:`_native_interval` -- the same "native interval"
+        concept used throughout this module (see the "Forcing values
+        and mass conservation across dt" section) -- so this only works
+        when a raw table was actually loaded the generic way; a
+        subclass that overrides :meth:`load_data` and populates
+        ``self.data`` directly (see that method's docstring) has no
+        single native cadence to resample onto here.
+
+        :returns: The upscaled DataFrame, or ``None`` if no raw forcing
+            table is available to derive a native cadence from.
+        :rtype: pandas.DataFrame or None
+        """
+        if self._forcing_table is None or self.results is None:
+            return None
+
+        raw_index = pd.DatetimeIndex(
+            sorted(pd.to_datetime(self._forcing_table[self._forcing_time_col]).unique())
+        )
+        native_dt = _native_interval(pd.Series(0.0, index=raw_index))
+        if native_dt == pd.Timedelta(0):
+            return None
+
+        flow_names = {flow.name for flow in self.flows}
+        mean_cols = [c for c in self.results.columns if c not in flow_names]
+        sum_cols = [c for c in self.results.columns if c in flow_names]
+
+        pieces = []
+        if mean_cols:
+            pieces.append(
+                self.results[mean_cols].resample(
+                    native_dt, origin=raw_index[0], label="left", closed="left"
+                ).mean()
+            )
+        if sum_cols:
+            pieces.append(
+                self.results[sum_cols].resample(
+                    native_dt, origin=raw_index[0], label="left", closed="left"
+                ).sum()
+            )
+
+        upscaled = pd.concat(pieces, axis=1)
+        return upscaled[[c for c in self.results.columns if c in upscaled.columns]]
 
     def evaluate(self):
         """Placeholder for goodness-of-fit assessment against observed
@@ -2323,20 +2443,25 @@ class DynamicSystemModel:
 
     def export(self, path=None):
         """Bundle parameters, raw forcing data, and simulation results
-        (one combined levels+flows DataFrame).
+        (the combined levels+flows DataFrame, and its upscaled
+        companion if one could be built -- see
+        :meth:`_build_results_upscaled`).
 
         :param path: If given, also write the bundle to disk under this
             directory (``parameters.json``, ``data/<name>.csv`` per
-            forcing series, ``results.csv``).
+            forcing series, ``results.csv``, and ``results_upscaled.csv``
+            if ``self.results_upscaled`` is available).
         :type path: str or pathlib.Path or None
         :returns: The bundle, with keys ``"parameters"``, ``"data"``
-            (dict of forcing series), and ``"results"``.
+            (dict of forcing series), ``"results"``, and
+            ``"results_upscaled"``.
         :rtype: dict
         """
         bundle = {
             "parameters": self.parameters,
             "data": {name: forcing.series for name, forcing in self.data.items()},
             "results": self.results,
+            "results_upscaled": self.results_upscaled,
         }
         if path is not None:
             outdir = Path(path)
@@ -2346,6 +2471,8 @@ class DynamicSystemModel:
                 series.to_csv(outdir / "data" / f"{name}.csv")
             if self.results is not None:
                 self.results.to_csv(outdir / "results.csv")
+            if self.results_upscaled is not None:
+                self.results_upscaled.to_csv(outdir / "results_upscaled.csv")
         return bundle
 
 
