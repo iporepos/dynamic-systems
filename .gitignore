@@ -1,5 +1,6 @@
 outputs/
 inputs/
+scripts/
 .idea
 bench*.py
 
